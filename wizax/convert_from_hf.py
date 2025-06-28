@@ -10,9 +10,8 @@ from scalax.utils import JaxRNG, get_float_dtype_by_name
 import torch
 import einops
 from transformers import AutoModelForCausalLM
-from mintext.model import LLaMAModel
-from mintext.llama_configs import LLaMAConfigurator
-from mintext.utils import match_and_transform_dict
+from wizax.models import LLaMAModel, LLaMAConfigurator
+from wizax.utils import match_and_transform_dict
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
