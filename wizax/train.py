@@ -8,6 +8,7 @@ import mlxu
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as PS
+import optax
 from scalax.utils import JaxRNG, get_float_dtype_by_name
 from flax.training.train_state import TrainState
 from transformers import AutoTokenizer
@@ -127,16 +128,16 @@ def main(argv):
                 attention_mask=batch['attention_mask'],
                 position_ids=batch['position_ids'],
                 segment_ids=batch['segment_ids'],
-                deterministic=False,
-                rngs=rng_generator(LLaMAModel.rng_keys()),
             )
             return cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks']
             )
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         (loss, accuracy), grads = grad_fn(train_state['params'])
-        updates, train_state['opt_state'] = optimizer.update(grads, train_state['opt_state'])
-        train_state['params'] = optimizer.apply_updates(train_state['params'], updates)
+        updates, train_state['opt_state'] = optimizer.update(
+            grads, train_state['opt_state'], train_state['params']
+        )
+        train_state['params'] = optax.apply_updates(train_state['params'], updates)
         train_state['step'] += 1
         metrics = dict(
             loss=loss,
@@ -164,14 +165,12 @@ def main(argv):
     )
     def eval_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        logits = model.apply(
+        logits = model(
             train_state['params'],
             input_ids=batch['input_tokens'],
             attention_mask=batch['attention_masks'],
             position_ids=batch['position_ids'],
             segment_ids=batch['segment_ids'],
-            deterministic=True,
-            rngs=rng_generator(LLaMAModel.rng_keys()),
         )
         loss, accuracy = cross_entropy_loss_and_accuracy(
             logits,batch['target_tokens'], batch['loss_masks']

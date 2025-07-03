@@ -145,7 +145,7 @@ def apply_rotary_emb(xq, xk, position_ids, max_pos, theta=10000.0):
     return xq_out.astype(input_dtype), xk_out.astype(input_dtype)
 
 
-@dataclass(frozen=True)
+@dataclass
 class RMSNorm:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
@@ -161,14 +161,14 @@ class RMSNorm:
 
     def __call__(self, params, x):
         x = x.astype(self.dtype)
-        scale = param['scale'].astype(self.dtype)
+        scale = params['scale'].astype(self.dtype)
         rms = jnp.sqrt(
             self.config.rms_norm_eps + jnp.mean(x ** 2, axis=-1, keepdims=True)
         )
         return x / rms * scale
 
 
-@dataclass(frozen=True)
+@dataclass
 class Embedding:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
@@ -193,7 +193,7 @@ class Embedding:
         return x
 
 
-@dataclass(frozen=True)
+@dataclass
 class LMHead:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
@@ -212,12 +212,12 @@ class LMHead:
 
     def __call__(self, params, hidden_states):
         unembedding = params['unembedding'].astype(self.dtype)
-        logits = jnp.matmul(hidden_states, kernel)
+        logits = jnp.matmul(hidden_states, unembedding)
         logits = with_sharding_annotation(logits, 'logits')
         return logits
 
 
-@dataclass(frozen=True)
+@dataclass
 class FeedForward:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
@@ -261,16 +261,20 @@ class FeedForward:
         return x
 
 
-@dataclass(frozen=True)
+@dataclass
 class Attention:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
+    def __post_init__(self):
+        assert self.config.hidden_size % self.config.num_key_value_heads == 0
+        assert self.config.hidden_size % self.config.num_attention_heads == 0
+        self.num_query_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+
     def init(self, rng):
         assert self.config.hidden_size % self.config.num_key_value_heads == 0
         assert self.config.hidden_size % self.config.num_attention_heads == 0
-        num_query_groups = self.config.num_attention_heads // self.config.num_key_value_heads
         rng = JaxRNG(rng)
 
         return {
@@ -282,32 +286,29 @@ class Attention:
             ),
             'k_proj': nn.init_normal(
                 rng(),
-                (self.config.hidden_size, self.config.hidden_size // num_query_groups),
+                (self.config.hidden_size, self.config.hidden_size // self.num_query_groups),
                 scale=self.config.initializer_scale,
                 dtype=self.param_dtype,
             ),
             'v_proj': nn.init_normal(
                 rng(),
-                (self.config.hidden_size, self.config.hidden_size // num_query_groups),
+                (self.config.hidden_size, self.config.hidden_size // self.num_query_groups),
                 scale=self.config.initializer_scale,
                 dtype=self.param_dtype,
             ),
             'o_proj': nn.init_normal(
                 rng(),
-                (self.config.hidden_size, self.config.hidden_size // num_query_groups),
+                (self.config.hidden_size, self.config.hidden_size // self.num_query_groups),
                 scale=self.config.initializer_scale,
                 dtype=self.param_dtype,
             ),
         }
 
     def __call__(self, params, hidden_states, attention_mask, position_ids, segment_ids):
-        sequence_length = hidden_states.shape[1]
-        num_query_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-
         hidden_states = hidden_states.astype(self.dtype)
-        xq = jnp.matmul(hidden_states, params['q'].astype(self.dtype))
-        xk = jnp.matmul(hidden_states, params['k'].astype(self.dtype))
-        xv = jnp.matmul(hidden_states, params['v'].astype(self.dtype))
+        xq = jnp.matmul(hidden_states, params['q_proj'].astype(self.dtype))
+        xk = jnp.matmul(hidden_states, params['k_proj'].astype(self.dtype))
+        xv = jnp.matmul(hidden_states, params['v_proj'].astype(self.dtype))
         xq = einops.rearrange(
             xq, 'b s (h d) -> b s h d',
             h=self.config.num_attention_heads,
@@ -315,12 +316,12 @@ class Attention:
         xk = einops.repeat(
             xk, 'b s (h d) -> b s (h g) d',
             h=self.config.num_key_value_heads,
-            g=num_query_groups,
+            g=self.num_query_groups,
         )
         xv = einops.repeat(
             xv, 'b s (h d) -> b s (h g) d',
             h=self.config.num_key_value_heads,
-            g=num_query_groups,
+            g=self.num_query_groups,
         )
         xq = with_sharding_annotation(xq, 'attention_kqv')
         xk = with_sharding_annotation(xk, 'attention_kqv')
@@ -339,9 +340,8 @@ class Attention:
         attention_bias = einops.rearrange(attention_bias, 'b s -> b 1 1 s')
         attention_output = get_ring_attention_function(
             chunk_size=self.config.attention_chunk_size,
-            deterministic=deterministic,
+            deterministic=True,
             attention_dropout=self.config.attention_dropout,
-            dropout_rng=dropout_rng,
         )(xq, xk, xv, attention_bias, segment_ids).astype(self.dtype)
 
         attention_output = einops.rearrange(attention_output, 'b s h d -> b s (h d)')
@@ -352,52 +352,41 @@ class Attention:
         return x_out
 
 
-@dataclass(frozen=True)
-class TransformerBlock():
+@dataclass
+class TransformerBlock:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
-    def init(self, rng):
-        rng = JaxRNG(rng)
-        layernorm = RMSNorm(
+    def __post_init__(self):
+        self.layer_norm = RMSNorm(
             config=self.config,
             dtype=jnp.float32,
             param_dtype=self.param_dtype,
         )
+        self.attention = Attention(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.feedforward = FeedForward(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+
+    def init(self, rng):
+        rng = JaxRNG(rng)
         return {
-            'input_layernorm': layernorm.init(),
-            'post_attention_layernorm': layernorm.init(),
-            'self_attention': Attention(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-            ).init(rng()),
-            'feedforward': FeedForward(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-            ).init(rng()),
+            'input_layernorm': self.layer_norm.init(),
+            'post_attention_layernorm': self.layer_norm.init(),
+            'self_attention': self.attention.init(rng()),
+            'feedforward': self.feedforward.init(rng()),
         }
 
     def __call__(self, params, hidden_states, attention_mask, position_ids, segment_ids):
-        layernorm = RMSNorm(
-            config=self.config,
-            dtype=jnp.promote_types(self.dtype, jnp.float32),
-            param_dtype=self.param_dtype,
-        )
-        attention = Attention(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        )
-        feedforward = FeedForward(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        )
-        x_out = layernorm(params['input_layernorm'], hidden_states)
-        x_out = attention(
+        x_out = self.layer_norm(params['input_layernorm'], hidden_states)
+        x_out = self.attention(
             params['self_attention'],
             x_out,
             attention_mask,
@@ -405,83 +394,73 @@ class TransformerBlock():
             segment_ids,
         )
         mlp_inputs = x_out + hidden_states
-        x_out = layernorm(params['post_attention_layernorm'], mlp_inputs)
-        x_out = feedforward(params['feedforward'], x_out)
+        x_out = self.layer_norm(params['post_attention_layernorm'], mlp_inputs)
+        x_out = self.feedforward(params['feedforward'], x_out)
         return x_out + mlp_inputs
 
 
-@dataclass(frozen=True)
+@dataclass
 class LLaMAModel:
     config: mlxu.ConfigDict
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
 
+    def __post_init__(self):
+        self.embedding = Embedding(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.lm_head = LMHead(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.lm_head_norm = RMSNorm(
+            config=self.config,
+            dtype=jnp.float32,
+            param_dtype=self.param_dtype,
+        )
+        self.transformer_block = TransformerBlock(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+
     def init(self, rng):
         rng = JaxRNG(rng)
         params = {
-            'embedding': Embedding(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-            ).init(rng()),
-            'lm_head': LMHead(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-            ).init(rng()),
-            'lm_head_norm': RMSNorm(
-                config=self.config,
-                dtype=jnp.float32,
-                param_dtype=self.param_dtype,
-            ).init(),
+            'embedding': self.embedding.init(rng()),
+            'lm_head': self.lm_head.init(rng()),
+            'lm_head_norm': self.lm_head_norm.init(),
         }
         for i in range(self.config.num_hidden_layers):
-            params[f'transformer_block_{i}'] = TransformerBlock(
-                config=self.config,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-            ).init(rng())
+            params[f'transformer_block_{i}'] = self.transformer_block.init(rng())
         return params
 
-    def __call__(self, input_ids, attention_mask, position_ids, segment_ids):
+    def __call__(self, params, input_ids, attention_mask, position_ids, segment_ids):
         remat_policy = {
             'block': jax.checkpoint_policies.nothing_saveable,
             'dots': jax.checkpoint_policies.checkpoint_dots,
             'dots_with_no_batch_dims': jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims,
             'none': jax.checkpoint_policies.everything_saveable,
         }[self.config.remat]
-        remat_fn = lambda fn: jax.checkpoint(fn, policy=remat_policy)
-        embedding = remat(Embedding(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        ))
-        lm_head = remat(LMHead(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        ))
-        lm_head_norm = remat(RMSNorm(
-            config=self.config,
-            dtype=jnp.float32,
-            param_dtype=self.param_dtype,
-        ))
-        transformer_block = remat(TransformerBlock(
-            config=self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-        ))
 
-        hidden_states = embedding(self.params['embedding'], input_ids)
+        embedding = jax.checkpoint(self.embedding.__call__, policy=remat_policy)
+        lm_head = jax.checkpoint(self.lm_head.__call__, policy=remat_policy)
+        lm_head_norm = jax.checkpoint(self.lm_head_norm.__call__, policy=remat_policy)
+        transformer_block = jax.checkpoint(self.transformer_block.__call__, policy=remat_policy)
+
+        hidden_states = embedding(params['embedding'], input_ids)
         for i in range(self.config.num_hidden_layers):
             hidden_states = transformer_block(
-                self.params[f'transformer_block_{i}'],
+                params[f'transformer_block_{i}'],
                 hidden_states,
                 attention_mask,
                 position_ids,
                 segment_ids,
             )
 
-        hidden_states = lm_head_norm(hidden_states)
-        logits = lm_head(self.params['lm_head'], hidden_states)
+        hidden_states = lm_head_norm(params['lm_head_norm'], hidden_states)
+        logits = lm_head(params['lm_head'], hidden_states)
         return logits
