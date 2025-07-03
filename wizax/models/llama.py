@@ -159,7 +159,7 @@ class RMSNorm:
             )
         }
 
-    def __call__(self, params, x):
+    def forward(self, params, x):
         x = x.astype(self.dtype)
         scale = params['scale'].astype(self.dtype)
         rms = jnp.sqrt(
@@ -186,7 +186,7 @@ class Embedding:
             ),
         }
 
-    def __call__(self, params, input_ids):
+    def forward(self, params, input_ids):
         embedding = params['embedding'].astype(self.dtype)
         x = jnp.take(embedding, input_ids, axis=0)
         x = with_sharding_annotation(x, 'embedding')
@@ -210,7 +210,7 @@ class LMHead:
             ),
         }
 
-    def __call__(self, params, hidden_states):
+    def forward(self, params, hidden_states):
         unembedding = params['unembedding'].astype(self.dtype)
         logits = jnp.matmul(hidden_states, unembedding)
         logits = with_sharding_annotation(logits, 'logits')
@@ -247,7 +247,7 @@ class FeedForward:
 
         }
 
-    def __call__(self, params, x):
+    def forward(self, params, x):
         gate_proj = params['gate_proj'].astype(self.dtype)
         down_proj = params['down_proj'].astype(self.dtype)
         up_proj = params['up_proj'].astype(self.dtype)
@@ -304,7 +304,7 @@ class Attention:
             ),
         }
 
-    def __call__(self, params, hidden_states, attention_mask, position_ids, segment_ids):
+    def forward(self, params, hidden_states, attention_mask, position_ids, segment_ids):
         hidden_states = hidden_states.astype(self.dtype)
         xq = jnp.matmul(hidden_states, params['q_proj'].astype(self.dtype))
         xk = jnp.matmul(hidden_states, params['k_proj'].astype(self.dtype))
@@ -384,9 +384,9 @@ class TransformerBlock:
             'feedforward': self.feedforward.init(rng()),
         }
 
-    def __call__(self, params, hidden_states, attention_mask, position_ids, segment_ids):
-        x_out = self.layer_norm(params['input_layernorm'], hidden_states)
-        x_out = self.attention(
+    def forward(self, params, hidden_states, attention_mask, position_ids, segment_ids):
+        x_out = self.layer_norm.forward(params['input_layernorm'], hidden_states)
+        x_out = self.attention.forward(
             params['self_attention'],
             x_out,
             attention_mask,
@@ -394,8 +394,8 @@ class TransformerBlock:
             segment_ids,
         )
         mlp_inputs = x_out + hidden_states
-        x_out = self.layer_norm(params['post_attention_layernorm'], mlp_inputs)
-        x_out = self.feedforward(params['feedforward'], x_out)
+        x_out = self.layer_norm.forward(params['post_attention_layernorm'], mlp_inputs)
+        x_out = self.feedforward.forward(params['feedforward'], x_out)
         return x_out + mlp_inputs
 
 
@@ -438,7 +438,7 @@ class LLaMAModel:
             params[f'transformer_block_{i}'] = self.transformer_block.init(rng())
         return params
 
-    def __call__(self, params, input_ids, attention_mask, position_ids, segment_ids):
+    def forward(self, params, input_ids, attention_mask, position_ids, segment_ids):
         remat_policy = {
             'block': jax.checkpoint_policies.nothing_saveable,
             'dots': jax.checkpoint_policies.checkpoint_dots,
@@ -446,10 +446,10 @@ class LLaMAModel:
             'none': jax.checkpoint_policies.everything_saveable,
         }[self.config.remat]
 
-        embedding = jax.checkpoint(self.embedding.__call__, policy=remat_policy)
-        lm_head = jax.checkpoint(self.lm_head.__call__, policy=remat_policy)
-        lm_head_norm = jax.checkpoint(self.lm_head_norm.__call__, policy=remat_policy)
-        transformer_block = jax.checkpoint(self.transformer_block.__call__, policy=remat_policy)
+        embedding = jax.checkpoint(self.embedding.forward, policy=remat_policy)
+        lm_head = jax.checkpoint(self.lm_head.forward, policy=remat_policy)
+        lm_head_norm = jax.checkpoint(self.lm_head_norm.forward, policy=remat_policy)
+        transformer_block = jax.checkpoint(self.transformer_block.forward, policy=remat_policy)
 
         hidden_states = embedding(params['embedding'], input_ids)
         for i in range(self.config.num_hidden_layers):

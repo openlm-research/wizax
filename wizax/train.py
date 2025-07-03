@@ -122,7 +122,7 @@ def main(argv):
     def train_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         def loss_and_accuracy(params):
-            logits = model(
+            logits = model.forward(
                 params,
                 input_ids=batch['input_tokens'],
                 attention_mask=batch['attention_mask'],
@@ -165,7 +165,7 @@ def main(argv):
     )
     def eval_step_fn(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
-        logits = model(
+        logits = model.forward(
             train_state['params'],
             input_ids=batch['input_tokens'],
             attention_mask=batch['attention_masks'],
